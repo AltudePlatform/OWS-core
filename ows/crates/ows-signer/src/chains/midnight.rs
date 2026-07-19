@@ -385,6 +385,28 @@ impl MidnightSigner {
             dust: self.derive_dust_address_from_seed(seeds.dust.expose())?,
         })
     }
+
+    /// Derive the Zswap (shielded) secret keys from the 32-byte shielded role seed. The keys are
+    /// held inside a [`MidnightCryptoProvider`]; balance code holds only `&MidnightCryptoProvider`.
+    fn zswap_secret_keys_from_seed(seed: &[u8]) -> Result<ZswapSecretKeys, SignerError> {
+        let seed_arr = Zeroizing::new(<[u8; 32]>::try_from(seed).map_err(|_| {
+            SignerError::InvalidPrivateKey(format!(
+                "expected 32-byte shielded seed, got {} bytes",
+                seed.len()
+            ))
+        })?);
+        Ok(ZswapSecretKeys::from(ZswapSeed::from(*seed_arr)))
+    }
+
+    /// Decode the `credential` (a packed Midnight signing key) into a [`MidnightCryptoProvider`]
+    /// that holds the account seeds and the keys derived from them. All key material stays inside
+    /// the provider — balance call sites in `ows-midnight` hold only `&MidnightCryptoProvider`.
+    pub fn crypto_provider(
+        &self,
+        credential: &SecretBytes,
+    ) -> Result<MidnightCryptoProvider, SignerError> {
+        MidnightCryptoProvider::from_credential(credential)
+    }
 }
 
 fn scale_bigint_encode_biguint(n: &BigUint) -> Result<Vec<u8>, SignerError> {
@@ -402,6 +424,68 @@ fn scale_bigint_encode_biguint(n: &BigUint) -> Result<Vec<u8>, SignerError> {
     sb.serialize(&mut out)
         .map_err(|e| SignerError::AddressDerivationFailed(e.to_string()))?;
     Ok(out)
+}
+
+/// Holds the decoded Midnight account seeds plus the keys derived from them once at construction.
+/// Created via [`MidnightSigner::crypto_provider`]. Keys never leave the provider — callers get
+/// public outputs only (addresses, the dust public key, a fingerprint), so balance code can hold
+/// `&MidnightCryptoProvider` instead of raw seed bytes.
+pub struct MidnightCryptoProvider {
+    seeds: MidnightSeeds,
+    // Read by shielded detection, which lands in a following commit.
+    #[allow(dead_code)]
+    shielded_keys: ZswapSecretKeys,
+    dust_sk: DustSecretKey,
+}
+
+impl MidnightCryptoProvider {
+    fn from_credential(credential: &SecretBytes) -> Result<Self, SignerError> {
+        let seeds = MidnightSigner::decode_keys(credential.expose())?;
+        let shielded_keys = MidnightSigner::zswap_secret_keys_from_seed(seeds.shielded.expose())?;
+        let dust_seed =
+            Zeroizing::new(<[u8; 32]>::try_from(seeds.dust.expose()).map_err(|_| {
+                SignerError::InvalidPrivateKey("dust seed must be 32 bytes".into())
+            })?);
+        let dust_sk = DustSecretKey::derive_secret_key(&dust_seed);
+        Ok(Self {
+            seeds,
+            shielded_keys,
+            dust_sk,
+        })
+    }
+
+    /// Derive all three Midnight addresses (unshielded / shielded / dust) for `network` from the
+    /// seeds held in this provider — equivalent to [`MidnightSigner::derive_addresses`] on the
+    /// packed blob, but the seeds are used directly.
+    pub fn addresses(&self, network: &MidnightNetwork) -> Result<MidnightAddresses, SignerError> {
+        let signer = MidnightSigner {
+            network: network.clone(),
+        };
+        Ok(MidnightAddresses {
+            unshielded: signer.derive_unshielded_address_with_hrp(
+                self.seeds.unshielded.expose(),
+                &network.unshielded_hrp()?,
+            )?,
+            shielded: signer.derive_shielded_address_with_hrp(
+                self.seeds.shielded.expose(),
+                &network.shielded_hrp()?,
+            )?,
+            dust: signer.derive_dust_address_from_seed(self.seeds.dust.expose())?,
+        })
+    }
+
+    /// Public key for the dust (registration/fee) role derived from the dust secret key.
+    pub fn dust_public_key(&self) -> Result<DustPublicKey, SignerError> {
+        Ok(DustPublicKey::from(self.dust_sk.clone()))
+    }
+
+    /// A 32-byte fingerprint of the shielded seed — the first 32 bytes of SHA-256(seed). Stable
+    /// across sessions, so a snapshot is only reused for the same key material; consumers take
+    /// `[..16]` and hex-encode for a compact string cache key.
+    pub fn shielded_key_fingerprint(&self) -> Result<[u8; 32], SignerError> {
+        let digest = sha2::Sha256::digest(self.seeds.shielded.expose());
+        Ok(digest.into())
+    }
 }
 
 impl ChainSigner for MidnightSigner {
@@ -517,6 +601,32 @@ mod tests {
             signer.derive_address(&signing_key_blob()).unwrap(),
             "mn_addr1dwv2rta0a2skyhrvukaw2q9r2sq6yc4jhj63rf7afxpkrrv6g35qw3dyt6"
         );
+    }
+
+    #[test]
+    fn crypto_provider_addresses_equals_derive_addresses() {
+        let blob = signing_key_blob();
+        let provider = MidnightSigner::mainnet()
+            .crypto_provider(&SecretBytes::from_slice(&blob))
+            .unwrap();
+        let expected = MidnightSigner::mainnet().derive_addresses(&blob).unwrap();
+        let got = provider.addresses(&MidnightNetwork::mainnet()).unwrap();
+        assert_eq!(got.unshielded, expected.unshielded);
+        assert_eq!(got.shielded, expected.shielded);
+        assert_eq!(got.dust, expected.dust);
+    }
+
+    #[test]
+    fn crypto_provider_dust_key_and_fingerprint_derive_from_seeds() {
+        let provider = MidnightSigner::mainnet()
+            .crypto_provider(&SecretBytes::from_slice(&signing_key_blob()))
+            .unwrap();
+        // Dust public key equals deriving it straight from the role seed.
+        let dust_seed: [u8; 32] = hex::decode(DUST_KEY_HEX).unwrap().try_into().unwrap();
+        let expect_dpk = DustPublicKey::from(DustSecretKey::derive_secret_key(&dust_seed));
+        assert_eq!(provider.dust_public_key().unwrap(), expect_dpk);
+        // The shielded key never leaves the provider; its fingerprint is stable and non-zero.
+        assert_ne!(provider.shielded_key_fingerprint().unwrap(), [0u8; 32]);
     }
 
     // Role seeds for the abandon-phrase wallet at index 0
