@@ -1,11 +1,13 @@
 //! Midnight wallet helpers used by the balance-display path: indexer URL and
 //! sync-cache scope resolution.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use ows_core::Config;
 
 use super::cache_io::SyncCacheScope;
+use super::unshielded_sync::UnshieldedUtxo;
 
 fn invalid_input(msg: impl Into<String>) -> std::io::Error {
     std::io::Error::other(msg.into())
@@ -37,4 +39,48 @@ pub fn sync_scope_for_wallet(
         scope = scope.with_chain_id(cid);
     }
     scope
+}
+
+/// Sum unshielded UTXO values per token type. The values come from the indexer, so a total that
+/// overflows is an error, not a wrapped (release) or panicking (debug) sum.
+pub fn sum_utxos_by_token(
+    utxos: &[UnshieldedUtxo],
+) -> Result<BTreeMap<String, u128>, std::io::Error> {
+    let mut totals: BTreeMap<String, u128> = BTreeMap::new();
+    for u in utxos {
+        let total = totals.entry(u.token_type.clone()).or_insert(0);
+        *total = total.checked_add(u.value).ok_or_else(|| {
+            invalid_input(format!(
+                "unshielded {} balance overflows u128",
+                u.token_type
+            ))
+        })?;
+    }
+    Ok(totals)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn utxo(value: u128) -> UnshieldedUtxo {
+        UnshieldedUtxo {
+            token_type: "00".repeat(32),
+            value,
+            intent_hash: String::new(),
+            output_index: 0,
+            owner: String::new(),
+            ctime_unix_secs: None,
+            registered_for_dust_generation: false,
+        }
+    }
+
+    #[test]
+    fn an_overflowing_unshielded_total_is_an_error() {
+        assert!(sum_utxos_by_token(&[utxo(u128::MAX), utxo(2)]).is_err());
+        assert_eq!(
+            sum_utxos_by_token(&[utxo(u128::MAX - 2), utxo(2)]).unwrap()[&"00".repeat(32)],
+            u128::MAX
+        );
+    }
 }
