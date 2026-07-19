@@ -2878,6 +2878,7 @@ dependencies = [
  "libc",
  "midnight-ledger",
  "midnight-serialize",
+ "midnight-storage",
  "midnight-zswap",
  "mockito",
  "num-bigint",
