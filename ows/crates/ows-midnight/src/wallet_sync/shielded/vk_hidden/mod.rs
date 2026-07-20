@@ -1,27 +1,26 @@
-//! Full `zswapLedgerEvents` replay (Mode B) for shielded balance sync.
+//! VK-hidden shielded sync: full `zswapLedgerEvents` replay.
 //!
-//! No viewing key is sent to the indexer. We subscribe to every zswap event,
-//! decode each one locally with `tagged_deserialize<Event>`, and identify owned
-//! coins by handing each output's preimage evidence to the crypto provider's
-//! `detect_shielded_output` (the keys stay inside the provider), matching the
-//! returned nullifier against later inputs.
+//! No viewing key is sent to the indexer. We subscribe to every zswap event, decode each one
+//! locally with `tagged_deserialize<Event>`, and fold it into a full `ZswapLocalState` (the
+//! commitment Merkle tree + qualified coins) via `replay_events` — the spendable wallet state.
+//! Balances are derived from that state; nothing here is signing-specific, every sync builds it.
+
+mod sync_cache;
 
 use futures_util::{SinkExt as _, StreamExt as _};
-use midnight_coin_structure::coin;
-use midnight_ledger::events::{Event, EventDetails};
+use midnight_ledger::events::Event;
 use midnight_serialize::tagged_deserialize;
 use midnight_storage::db::InMemoryDB;
+use midnight_zswap::local::State as ZswapLocalState;
 use ows_signer::chains::MidnightCryptoProvider;
 use serde::Deserialize;
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use super::sync_cache;
+use super::ShieldedWalletState;
 use crate::cache_io::{self, SyncCacheScope};
 use crate::indexer_ws::{self, IndexerWs};
 use crate::midnight_env::{self, SyncStream};
-use crate::ShieldedBalances;
 
 const ZSWAP_LEDGER_SUB: &str = r#"
 subscription ZswapLedgerEvents($id: Int) {
@@ -29,45 +28,60 @@ subscription ZswapLedgerEvents($id: Int) {
 }
 "#;
 
-/// Consecutive connections that advance nothing before a replay gives up. Only a stalled connection
-/// counts: a provider that recycles long-lived sockets mid-replay never exhausts the budget.
-const ZSWAP_SYNC_MAX_STALLED_ATTEMPTS: u32 = 4;
-
-pub(super) fn token_type_hex(ci: &coin::Info) -> String {
-    let t = ci.type_.into_inner();
-    format!("0x{}", hex::encode(t.0))
-}
-
 /// Persist a progress snapshot every N applied events during a long replay, so a later run
 /// resumes near the tip even if this one is interrupted.
 const ZSWAP_SNAPSHOT_INTERVAL: u64 = 1000;
 
-pub(super) fn balances_from_owned_coins(
-    owned: &BTreeMap<coin::Nullifier, coin::Info>,
-) -> ShieldedBalances {
-    let mut balances: ShieldedBalances = BTreeMap::new();
-    for ci in owned.values() {
-        *balances.entry(token_type_hex(ci)).or_insert(0) += ci.value;
-    }
-    balances
+/// Consecutive connections that advance nothing before a replay gives up. Only a stalled connection
+/// counts: a provider that recycles long-lived sockets mid-replay never exhausts the budget.
+const ZSWAP_SYNC_MAX_STALLED_ATTEMPTS: u32 = 4;
+
+/// "Nothing synced yet" resume cursor. zswap ledger event ids start at 0, so genesis must sit
+/// below 0 to stay distinct from "synced through event 0"; `resume_subscribe_id` clamps it to 0.
+const GENESIS_CURSOR: i64 = -1;
+
+/// VK-hidden shielded wallet sync: replay `zswapLedgerEvents` into a full spendable
+/// `ZswapLocalState` without ever sending a viewing key to the indexer, persisting it for resume
+/// and later spends. Resumes from this zswap key's disk snapshot when present, else from genesis.
+pub(super) async fn sync_wallet(
+    indexer_url: &str,
+    crypto_provider: &MidnightCryptoProvider,
+    scope: &SyncCacheScope,
+    current_block_height: Option<i64>,
+) -> Result<ShieldedWalletState, std::io::Error> {
+    let seed_fp = hex::encode(
+        &crypto_provider
+            .shielded_key_fingerprint()
+            .map_err(|e| std::io::Error::other(e.to_string()))?[..16],
+    );
+    let state = run_zswap_replay(
+        indexer_url,
+        crypto_provider,
+        scope,
+        &seed_fp,
+        current_block_height,
+    )
+    .await?;
+    Ok(ShieldedWalletState {
+        zswap: state.wallet,
+    })
 }
 
-/// Zswap-ledger-events shielded balance fetch — VK-free path (Mode B).
-///
-/// Resumes from this zswap key's disk snapshot (unspent owned coins + cursor) when present,
-/// otherwise replays from genesis; the synced coin set is persisted for the next run.
-pub(super) async fn fetch_balances(
+/// Drive the `zswapLedgerEvents` replay into a spendable `ZswapLocalState`, resuming from this
+/// key's snapshot when present. Returns the final replay state; the caller projects the wallet
+/// (and balances) from it.
+async fn run_zswap_replay(
     indexer_url: &str,
     crypto_provider: &MidnightCryptoProvider,
     scope: &SyncCacheScope,
     seed_fp: &str,
     current_block_height: Option<i64>,
-) -> Result<ShieldedBalances, std::io::Error> {
+) -> Result<ZswapReplayState, std::io::Error> {
     let fp = cache_io::sync_site_fingerprint(indexer_url, scope);
     let cache_path = sync_cache::snapshot_path(indexer_url, seed_fp, scope);
 
-    let mut owned: BTreeMap<coin::Nullifier, coin::Info> = BTreeMap::new();
-    let mut last_seen_id: i64 = -1;
+    let mut wallet = ZswapLocalState::new();
+    let mut last_seen_id: i64 = GENESIS_CURSOR;
     let mut max_id: Option<i64> = None;
     let mut saved_block_height: i64 = 0;
 
@@ -80,31 +94,40 @@ pub(super) async fn fetch_balances(
                 && snap.zswap_key_fingerprint == seed_fp
         })
         .and_then(|snap| {
-            let owned = sync_cache::decode_owned_coins(&snap.owned_coins).ok()?;
+            let w = super::cache::decode_zswap_state(&snap.zswap_state_hex).ok()?;
             Some((
-                owned,
+                w,
                 snap.last_seen_event_id,
                 snap.max_id_when_saved,
                 snap.block_height_when_saved,
             ))
         });
-    if let Some((resumed_owned, last, saved_max, saved_height)) = resumed {
-        owned = resumed_owned;
+    if let Some((resumed_wallet, last, saved_max, saved_height)) = resumed {
+        wallet = resumed_wallet;
         last_seen_id = last;
         max_id = Some(saved_max);
         saved_block_height = saved_height;
         eprintln!(
-            "[ows-midnight] zswapLedgerEvents: resuming from event id {} ({} unspent coins, saved tip {saved_max})",
-            resume_subscribe_id(last_seen_id),
-            owned.len()
+            "[ows-midnight] zswapLedgerEvents: resuming spend wallet from snapshot (event id {}, saved tip {saved_max})",
+            resume_subscribe_id(last_seen_id)
         );
     } else {
         eprintln!("[ows-midnight] zswapLedgerEvents: replaying from genesis");
     }
 
+    let mut state = ZswapReplayState {
+        wallet,
+        last_seen_id,
+        max_id,
+        n_events: 0,
+        last_event_at: None,
+    };
+
     // Fast path: when the indexer's HTTP tip height matches the snapshot's, the snapshot
     // already reflects the live tip — skip the WebSocket catch-up entirely.
-    let snapshot_complete = max_id.is_some_and(|m| m > 0 && last_seen_id >= m);
+    let snapshot_complete = state
+        .max_id
+        .is_some_and(|m| m > 0 && state.last_seen_id >= m);
     if crate::tip_verify::snapshot_fresh_by_http_tip(
         current_block_height,
         saved_block_height,
@@ -113,17 +136,9 @@ pub(super) async fn fetch_balances(
         eprintln!(
             "[ows-midnight] zswapLedgerEvents: indexer block height unchanged ({saved_block_height}); using on-disk snapshot"
         );
-        return Ok(balances_from_owned_coins(&owned));
+        return Ok(state);
     }
 
-    let mut state = ZswapReplayState {
-        owned,
-        last_seen_id,
-        max_id,
-        n_events: 0,
-        n_outputs_decrypted: 0,
-        last_event_at: None,
-    };
     let cfg = ZswapReplayCfg {
         ws_idle: midnight_env::ws_idle_timeout(SyncStream::Shielded),
         stall_timeout: midnight_env::stall_timeout(SyncStream::Shielded),
@@ -211,26 +226,23 @@ pub(super) async fn fetch_balances(
 
     save_zswap_snapshot(cache.as_ref(), &state);
 
-    let balances = balances_from_owned_coins(&state.owned);
-
     eprintln!(
-        "[ows-midnight] zswapLedgerEvents replay done: events_seen={} decrypted_outputs={} token_kinds={} last_seen_id={} max_id={:?}",
-        state.n_events,
-        state.n_outputs_decrypted,
-        balances.len(),
-        state.last_seen_id,
-        state.max_id
+        "[ows-midnight] zswapLedgerEvents replay done: events_seen={} last_seen_id={} max_id={:?}",
+        state.n_events, state.last_seen_id, state.max_id
     );
 
-    Ok(balances)
+    Ok(state)
 }
 
 struct ZswapReplayState {
-    owned: BTreeMap<coin::Nullifier, coin::Info>,
+    /// Full spendable state (Merkle tree + qualified coins), built on every sync; the snapshot
+    /// persists it and the balance is derived from it.
+    wallet: ZswapLocalState<InMemoryDB>,
+    /// Highest event id folded into `wallet` — the wallet holds exactly the events up to it, so it
+    /// is both the resume cursor and the fold gate.
     last_seen_id: i64,
     max_id: Option<i64>,
     n_events: u64,
-    n_outputs_decrypted: u64,
     last_event_at: Option<Instant>,
 }
 
@@ -252,13 +264,14 @@ struct ZswapCache<'a> {
     block_height: i64,
 }
 
-/// Persist the unspent owned coins + cursor for the next run (best-effort; ignored when caching
-/// is disabled or serialization fails).
+/// Persist the spendable wallet state + cursor for the next run (best-effort; ignored when caching
+/// is disabled or serialization fails). The freshly built wallet is always current, so it is
+/// persisted directly — no stale-tree preservation dance.
 fn save_zswap_snapshot(cache: Option<&ZswapCache<'_>>, state: &ZswapReplayState) {
     let Some(cache) = cache else {
         return;
     };
-    let Ok(owned_coins) = sync_cache::encode_owned_coins(&state.owned) else {
+    let Ok(zswap_state_hex) = super::cache::encode_zswap_state(&state.wallet) else {
         return;
     };
     cache_io::try_save(
@@ -274,7 +287,7 @@ fn save_zswap_snapshot(cache: Option<&ZswapCache<'_>>, state: &ZswapReplayState)
                 .map(|m| m.max(state.last_seen_id))
                 .unwrap_or(state.last_seen_id),
             block_height_when_saved: cache.block_height,
-            owned_coins,
+            zswap_state_hex,
         },
     );
 }
@@ -282,47 +295,35 @@ fn save_zswap_snapshot(cache: Option<&ZswapCache<'_>>, state: &ZswapReplayState)
 /// Subscribe id for resuming the zswap ledger subscription. The indexer treats `id` as an
 /// inclusive lower bound, so resuming from the last-seen event re-sends that event —
 /// carrying the live max id — instead of tailing silently past the tip when nothing new has
-/// happened. Re-applying it is a no-op (`apply_zswap_event` inserts/removes by nullifier).
-/// The unshielded sync resumes the same way (inclusive cursor + idempotent apply). Genesis
-/// (no cursor) starts at 0.
+/// happened. The unshielded sync resumes the same way. Genesis (no cursor) starts at 0.
 fn resume_subscribe_id(last_seen_id: i64) -> i64 {
     last_seen_id.max(0)
 }
 
-/// Decode one raw zswap ledger event and apply it to `owned` via the crypto provider: an owned
-/// output is inserted by nullifier, a spent input removed. Returns 1 if an owned output was
-/// detected, else 0. Coin detection (the only key-bearing step) happens inside the provider.
-fn apply_zswap_event(
+/// Decode one raw zswap ledger event and fold it into the spendable `ZswapLocalState` via
+/// `crypto_provider.fold_shielded` — adding owned output commitments to the Merkle tree and
+/// removing spent inputs. This is the single source for both the balance (summed from the
+/// wallet's coins) and spends.
+fn fold_zswap_event(
     crypto_provider: &MidnightCryptoProvider,
-    owned: &mut BTreeMap<coin::Nullifier, coin::Info>,
+    wallet: &mut ZswapLocalState<InMemoryDB>,
     raw: &str,
-) -> Result<u64, std::io::Error> {
+) -> Result<(), std::io::Error> {
     let raw_hex = raw.strip_prefix("0x").unwrap_or(raw);
     let bytes = hex::decode(raw_hex)
         .map_err(|e| std::io::Error::other(format!("invalid zswap event raw hex: {e}")))?;
     let mut reader: &[u8] = &bytes;
     let ev: Event<InMemoryDB> = tagged_deserialize(&mut reader)
         .map_err(|e| std::io::Error::other(format!("decode zswap event: {e}")))?;
-    match ev.content {
-        EventDetails::ZswapOutput {
-            preimage_evidence, ..
-        } => {
-            if let Some((nul, ci)) = crypto_provider.detect_shielded_output(&preimage_evidence) {
-                owned.insert(nul, ci);
-                return Ok(1);
-            }
-        }
-        EventDetails::ZswapInput { nullifier, .. } => {
-            owned.remove(&nullifier);
-        }
-        _ => {}
-    }
-    Ok(0)
+    *wallet = crypto_provider
+        .fold_shielded(wallet.clone(), &ev)
+        .map_err(|e| std::io::Error::other(format!("replay zswap event into wallet: {e}")))?;
+    Ok(())
 }
 
-/// Drain zswap-ledger events from `ws`, applying each to `state` until the tip is
-/// reached or the socket drops. Transport only; per-event key-matching lives in
-/// [`apply_zswap_event`]. Returns `(dropped, events_seen_this_attempt)`.
+/// Drain zswap-ledger events from `ws`, folding each into `state.wallet` until the tip is
+/// reached or the socket drops. Transport only; per-event folding lives in [`fold_zswap_event`].
+/// Returns `(dropped, events_seen_this_attempt)`.
 async fn replay_zswap_ws_loop(
     ws: &mut IndexerWs,
     crypto_provider: &MidnightCryptoProvider,
@@ -418,17 +419,21 @@ indexer may be stalled",
                     Some(m) => m.max(evt.max_id),
                     None => evt.max_id,
                 });
-                state.last_seen_id = state.last_seen_id.max(evt.id);
                 state.n_events = state.n_events.saturating_add(1);
                 attempt_events = attempt_events.saturating_add(1);
 
-                let decrypted = apply_zswap_event(crypto_provider, &mut state.owned, &evt.raw)?;
-                state.n_outputs_decrypted = state.n_outputs_decrypted.saturating_add(decrypted);
+                // Every subscription — the first one and each reconnect — resumes inclusively, so
+                // the indexer re-sends the event at the cursor. It is already in the wallet, and
+                // `replay_events` rejects re-inserting a committed output, so fold only past it.
+                if evt.id > state.last_seen_id {
+                    fold_zswap_event(crypto_provider, &mut state.wallet, &evt.raw)?;
+                    state.last_seen_id = evt.id;
+                }
 
                 if state.n_events == 1 || state.n_events.is_multiple_of(cfg.progress_interval) {
                     eprintln!(
-                        "[ows-midnight] zswapLedgerEvents replay progress: last_seen_id={} max_id={:?} events_seen={} decrypted_outputs={}",
-                        state.last_seen_id, state.max_id, state.n_events, state.n_outputs_decrypted
+                        "[ows-midnight] zswapLedgerEvents replay progress: last_seen_id={} max_id={:?} events_seen={}",
+                        state.last_seen_id, state.max_id, state.n_events
                     );
                 }
                 if state.n_events.is_multiple_of(ZSWAP_SNAPSHOT_INTERVAL) {
@@ -468,14 +473,112 @@ struct ZswapLedgerEventWire {
 
 #[cfg(test)]
 mod tests {
-    use super::resume_subscribe_id;
+    use super::*;
+    use crate::mock_indexer::{self, MockEvent};
+    use midnight_base_crypto::hash::HashOutput;
+    use midnight_coin_structure::coin::Commitment;
+    use midnight_ledger::events::{EventDetails, EventSource, ZswapPreimageEvidence};
+    use midnight_ledger::structure::TransactionHash;
+    use midnight_serialize::tagged_serialize;
+    use ows_signer::chains::MidnightSigner;
+    use ows_signer::SecretBytes;
+
+    fn provider() -> MidnightCryptoProvider {
+        let mut blob = b"MNK1".to_vec();
+        blob.extend_from_slice(&[0x11; 32]);
+        blob.extend_from_slice(&[0x22; 32]);
+        blob.extend_from_slice(&[0x33; 32]);
+        MidnightSigner::mainnet()
+            .crypto_provider(&SecretBytes::new(blob))
+            .expect("provider")
+    }
+
+    /// A zswap ledger event committing someone else's output at `mt_index`: the wallet inserts it
+    /// into its commitment tree, which accepts only the next free index.
+    fn foreign_output(mt_index: u64) -> MockEvent {
+        foreign_output_at(mt_index as i64, mt_index)
+    }
+
+    /// [`foreign_output`] carried by the stream event `id`, which a reset chain no longer keeps in
+    /// step with the tree index.
+    fn foreign_output_at(id: i64, mt_index: u64) -> MockEvent {
+        let event = Event::<InMemoryDB> {
+            source: EventSource {
+                transaction_hash: TransactionHash(HashOutput([0; 32])),
+                logical_segment: 0,
+                physical_segment: 0,
+            },
+            content: EventDetails::ZswapOutput {
+                commitment: Commitment(HashOutput([mt_index as u8 + 1; 32])),
+                preimage_evidence: ZswapPreimageEvidence::None,
+                contract: None,
+                mt_index,
+            },
+        };
+        let mut raw = Vec::new();
+        tagged_serialize(&event, &mut raw).expect("serialize event");
+        MockEvent {
+            id,
+            raw: hex::encode(raw),
+        }
+    }
+
+    /// A connection that drops mid-replay reconnects from the last event folded, and the indexer
+    /// re-sends that event. It is already in the wallet, so folding it again would fail the
+    /// commitment tree's linear insertion and abort the whole balance run.
+    #[tokio::test]
+    async fn a_reconnect_does_not_fold_the_re_sent_boundary_event_twice() {
+        let url = mock_indexer::spawn(
+            "zswapLedgerEvents",
+            (0..6).map(foreign_output).collect(),
+            Some(3),
+        )
+        .await;
+        let vault = std::env::temp_dir().join(format!(
+            "ows-midnight-zswap-reconnect-{}",
+            std::process::id()
+        ));
+        let scope = SyncCacheScope::for_wallet("w", Some(&vault));
+
+        let state = run_zswap_replay(&url, &provider(), &scope, "fp", None).await;
+        let _ = std::fs::remove_dir_all(&vault);
+
+        let state = state.expect("the reconnect must resume the replay");
+        assert_eq!(state.last_seen_id, 5);
+        assert_eq!(state.wallet.first_free, 6);
+    }
+
+    /// A provider that recycles connections drops a long replay many times, each connection still
+    /// advancing it. Only connections that advance nothing count against the retry budget, so the
+    /// replay runs to the tip however many times its socket is recycled.
+    #[tokio::test]
+    async fn a_provider_that_recycles_connections_never_exhausts_the_retry_budget() {
+        let url = mock_indexer::spawn(
+            "zswapLedgerEvents",
+            (0..20).map(foreign_output).collect(),
+            Some(3),
+        )
+        .await;
+        let vault = std::env::temp_dir().join(format!(
+            "ows-midnight-zswap-recycled-{}",
+            std::process::id()
+        ));
+        let scope = SyncCacheScope::for_wallet("w", Some(&vault));
+
+        let state = run_zswap_replay(&url, &provider(), &scope, "fp", None).await;
+        let _ = std::fs::remove_dir_all(&vault);
+
+        let state = state.expect("a replay advancing on every connection must finish");
+        assert_eq!(state.last_seen_id, 19);
+        assert_eq!(state.wallet.first_free, 20);
+    }
 
     #[test]
     fn resume_is_inclusive_of_last_seen_event() {
         // Warm resume re-fetches the last-seen event (inclusive) so the indexer echoes it
         // and reveals the live max id, instead of tailing past the tip from last_seen+1.
         assert_eq!(resume_subscribe_id(84699), 84699);
-        // Genesis (no cursor, last_seen_id = -1) starts the replay at event 0.
+        // Genesis (no cursor, GENESIS_CURSOR = -1) starts the replay at event 0.
         assert_eq!(resume_subscribe_id(-1), 0);
         assert_eq!(resume_subscribe_id(0), 0);
     }

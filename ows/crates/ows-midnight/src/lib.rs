@@ -9,6 +9,8 @@ mod fund_balance;
 mod indexer_ws;
 mod ledger_params;
 mod midnight_env;
+#[cfg(test)]
+mod mock_indexer;
 mod tip_verify;
 mod urls;
 mod wallet;

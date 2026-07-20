@@ -1,11 +1,11 @@
 use bech32::{Bech32m, Hrp};
 use k256::schnorr::SigningKey;
-use midnight_coin_structure::coin;
-use midnight_coin_structure::transfer;
 use midnight_ledger::dust::{DustLocalState, DustPublicKey, DustSecretKey};
+use midnight_ledger::semantics::ZswapLocalStateExt as _;
 use midnight_serialize::{ScaleBigInt, Serializable};
 use midnight_storage::db::InMemoryDB;
 use midnight_zswap::keys::{SecretKeys as ZswapSecretKeys, Seed as ZswapSeed};
+use midnight_zswap::local::State as ZswapLocalState;
 use num_bigint::BigUint;
 use sha2::Digest;
 use zeroize::Zeroizing;
@@ -512,19 +512,17 @@ impl MidnightCryptoProvider {
         Ok(digest.into())
     }
 
-    /// Detect an owned shielded output from a zswap ledger event's preimage evidence, returning
-    /// the owned coin together with its nullifier — the only key-bearing step of the VK-free
-    /// replay. The shielded keys stay inside the provider; the caller does the keyless owned-set
-    /// bookkeeping (insert on output, remove on the matching input).
-    pub fn detect_shielded_output(
+    /// Fold one decoded zswap ledger event into the shielded wallet state, building the full
+    /// spendable `ZswapLocalState` (commitment Merkle tree + qualified coins). The coin detection
+    /// (spending key) stays inside the provider; the caller receives the updated state.
+    pub fn fold_shielded(
         &self,
-        evidence: &midnight_ledger::events::ZswapPreimageEvidence,
-    ) -> Option<(coin::Nullifier, coin::Info)> {
-        let ci = evidence.try_with_keys(&self.shielded_keys)?;
-        let nul = ci.nullifier(&transfer::SenderEvidence::User(std::borrow::Cow::Borrowed(
-            &self.shielded_keys.coin_secret_key,
-        )));
-        Some((nul, ci))
+        state: ZswapLocalState<InMemoryDB>,
+        ev: &midnight_ledger::events::Event<InMemoryDB>,
+    ) -> Result<ZswapLocalState<InMemoryDB>, SignerError> {
+        state
+            .replay_events(&self.shielded_keys, std::iter::once(ev))
+            .map_err(|e| SignerError::SigningFailed(format!("replay zswap event failed: {e:?}")))
     }
 }
 
