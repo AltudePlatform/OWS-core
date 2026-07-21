@@ -69,7 +69,8 @@ pub(super) async fn sync_wallet(
 
 /// Drive the `zswapLedgerEvents` replay into a spendable `ZswapLocalState`, resuming from this
 /// key's snapshot when present. Returns the final replay state; the caller projects the wallet
-/// (and balances) from it.
+/// (and balances) from it. A snapshot the live events do not fit is discarded and the wallet
+/// replayed from genesis.
 async fn run_zswap_replay(
     indexer_url: &str,
     crypto_provider: &MidnightCryptoProvider,
@@ -77,21 +78,73 @@ async fn run_zswap_replay(
     seed_fp: &str,
     current_block_height: Option<i64>,
 ) -> Result<ZswapReplayState, std::io::Error> {
+    let replay = |allow_resume| {
+        replay_zswap(
+            indexer_url,
+            crypto_provider,
+            scope,
+            seed_fp,
+            current_block_height,
+            allow_resume,
+        )
+    };
+    match replay(true).await {
+        Err(e) if crate::tip_verify::is_stale_snapshot(&e) => {
+            eprintln!(
+                "[ows-midnight] zswapLedgerEvents: the live events do not fit the snapshot ({e}); \
+discarding it and replaying from genesis"
+            );
+            replay(false).await
+        }
+        result => result,
+    }
+}
+
+/// One replay attempt behind [`run_zswap_replay`]: from this key's snapshot when `allow_resume`
+/// and one is usable, else from genesis.
+async fn replay_zswap(
+    indexer_url: &str,
+    crypto_provider: &MidnightCryptoProvider,
+    scope: &SyncCacheScope,
+    seed_fp: &str,
+    current_block_height: Option<i64>,
+    allow_resume: bool,
+) -> Result<ZswapReplayState, std::io::Error> {
     let fp = cache_io::sync_site_fingerprint(indexer_url, scope);
     let cache_path = sync_cache::snapshot_path(indexer_url, seed_fp, scope);
+    let live_genesis = if cache_path.is_some() {
+        crate::tip_verify::fetch_genesis_hash(indexer_url).await
+    } else {
+        None
+    };
 
     let mut wallet = ZswapLocalState::new();
     let mut last_seen_id: i64 = GENESIS_CURSOR;
     let mut max_id: Option<i64> = None;
     let mut saved_block_height: i64 = 0;
+    let mut genesis_hash = live_genesis.clone().unwrap_or_default();
 
     // Resume only from a snapshot for this same indexer site, network, and zswap key.
     let resumed = cache_path
         .as_ref()
+        .filter(|_| allow_resume)
         .and_then(|p| sync_cache::try_load_snapshot(p))
         .filter(|snap| {
             cache_io::snapshot_site_matches(scope, &snap.chain_id, &fp, &snap.indexer_fingerprint)
                 && snap.zswap_key_fingerprint == seed_fp
+        })
+        .filter(|snap| {
+            let foreign = crate::tip_verify::snapshot_from_other_chain(
+                &snap.genesis_hash,
+                live_genesis.as_deref(),
+            );
+            if foreign {
+                eprintln!(
+                    "[ows-midnight] zswapLedgerEvents: snapshot's genesis hash does not match the \
+live chain; discarding it and replaying from genesis"
+                );
+            }
+            !foreign
         })
         .and_then(|snap| {
             let w = super::cache::decode_zswap_state(&snap.zswap_state_hex).ok()?;
@@ -100,31 +153,79 @@ async fn run_zswap_replay(
                 snap.last_seen_event_id,
                 snap.max_id_when_saved,
                 snap.block_height_when_saved,
+                snap.genesis_hash,
             ))
         });
-    if let Some((resumed_wallet, last, saved_max, saved_height)) = resumed {
-        wallet = resumed_wallet;
-        last_seen_id = last;
-        max_id = Some(saved_max);
-        saved_block_height = saved_height;
-        eprintln!(
-            "[ows-midnight] zswapLedgerEvents: resuming spend wallet from snapshot (event id {}, saved tip {saved_max})",
-            resume_subscribe_id(last_seen_id)
-        );
+    // Live stream tip observed while validating a resume snapshot (None from genesis or an
+    // inconclusive probe). Used both to reject a stale snapshot and to skip the WebSocket
+    // catch-up when the snapshot already sits at the tip.
+    let mut live_tip: Option<i64> = None;
+    let mut from_snapshot = false;
+    if let Some((resumed_wallet, last, saved_max, saved_height, saved_genesis)) = resumed {
+        // Validate the snapshot's cursor against the live stream tip before trusting it. A cursor
+        // past the tip means an indexer/chain reset rewound the event ledger; resuming from it
+        // would subscribe past the tip and report the defunct chain's phantom balances. Probe only
+        // here (we have a snapshot to validate); an undetermined tip keeps the snapshot (fail-safe).
+        live_tip = match indexer_ws::probe_stream_max_id(indexer_url, ZSWAP_LEDGER_SUB).await {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!(
+                    "[ows-midnight] zswapLedgerEvents: tip probe failed ({e}); keeping snapshot"
+                );
+                None
+            }
+        };
+        if crate::tip_verify::snapshot_stale_by_event_tip(last, live_tip) {
+            eprintln!(
+                "[ows-midnight] zswapLedgerEvents: snapshot tip {last} is past the live tip {}; \
+discarding stale snapshot and replaying from genesis",
+                live_tip.unwrap_or(-1)
+            );
+        } else {
+            wallet = resumed_wallet;
+            from_snapshot = true;
+            last_seen_id = last;
+            max_id = Some(saved_max);
+            saved_block_height = saved_height;
+            if genesis_hash.is_empty() {
+                genesis_hash = saved_genesis;
+            }
+            eprintln!(
+                "[ows-midnight] zswapLedgerEvents: resuming spend wallet from snapshot (event id {}, saved tip {saved_max})",
+                resume_subscribe_id(last_seen_id)
+            );
+        }
     } else {
         eprintln!("[ows-midnight] zswapLedgerEvents: replaying from genesis");
     }
 
     let mut state = ZswapReplayState {
         wallet,
+        from_snapshot,
         last_seen_id,
         max_id,
         n_events: 0,
         last_event_at: None,
     };
 
-    // Fast path: when the indexer's HTTP tip height matches the snapshot's, the snapshot
-    // already reflects the live tip — skip the WebSocket catch-up entirely.
+    // Event-tip fast path: the resume probe already learned the live stream tip. When the snapshot
+    // sits at it, the on-disk state is current — return it without a WebSocket catch-up, which
+    // would otherwise idle-wait a full window for a boundary frame that never comes once the block
+    // advanced but no new ledger events did. More reliable than the HTTP height check below, which
+    // misses whenever the block advanced with no zswap events.
+    if live_tip.is_some_and(|m| m > 0 && state.last_seen_id >= m) {
+        eprintln!(
+            "[ows-midnight] zswapLedgerEvents: snapshot already at live tip {}; using on-disk snapshot",
+            state.last_seen_id
+        );
+        return Ok(state);
+    }
+
+    // HTTP-tip fallback, used only when the event-tip probe above was inconclusive (`live_tip`
+    // is `None`): when the indexer's block height still matches the snapshot's, skip the WebSocket
+    // catch-up. With a known `live_tip` the event-tip fast path already decided, so this must not
+    // fire — otherwise a height that held steady while ledger events advanced would return a stale
+    // wallet.
     let snapshot_complete = state
         .max_id
         .is_some_and(|m| m > 0 && state.last_seen_id >= m);
@@ -132,6 +233,7 @@ async fn run_zswap_replay(
         current_block_height,
         saved_block_height,
         snapshot_complete,
+        live_tip,
     ) {
         eprintln!(
             "[ows-midnight] zswapLedgerEvents: indexer block height unchanged ({saved_block_height}); using on-disk snapshot"
@@ -151,6 +253,7 @@ async fn run_zswap_replay(
         fp: &fp,
         key_fp: seed_fp,
         block_height: current_block_height.unwrap_or(0),
+        genesis_hash: &genesis_hash,
     });
 
     let mut stalled_attempts = 0u32;
@@ -238,6 +341,8 @@ struct ZswapReplayState {
     /// Full spendable state (Merkle tree + qualified coins), built on every sync; the snapshot
     /// persists it and the balance is derived from it.
     wallet: ZswapLocalState<InMemoryDB>,
+    /// Whether `wallet` started from a disk snapshot, so a fold failure proves the snapshot stale.
+    from_snapshot: bool,
     /// Highest event id folded into `wallet` — the wallet holds exactly the events up to it, so it
     /// is both the resume cursor and the fold gate.
     last_seen_id: i64,
@@ -262,6 +367,8 @@ struct ZswapCache<'a> {
     /// Indexer HTTP tip height observed at sync start; stamped onto saved snapshots so a
     /// later run can skip the WebSocket catch-up when the tip is unchanged.
     block_height: i64,
+    /// Genesis hash of the chain being synced (empty when unknown); stamped onto saved snapshots.
+    genesis_hash: &'a str,
 }
 
 /// Persist the spendable wallet state + cursor for the next run (best-effort; ignored when caching
@@ -287,6 +394,7 @@ fn save_zswap_snapshot(cache: Option<&ZswapCache<'_>>, state: &ZswapReplayState)
                 .map(|m| m.max(state.last_seen_id))
                 .unwrap_or(state.last_seen_id),
             block_height_when_saved: cache.block_height,
+            genesis_hash: cache.genesis_hash.to_string(),
             zswap_state_hex,
         },
     );
@@ -308,6 +416,7 @@ fn fold_zswap_event(
     crypto_provider: &MidnightCryptoProvider,
     wallet: &mut ZswapLocalState<InMemoryDB>,
     raw: &str,
+    from_snapshot: bool,
 ) -> Result<(), std::io::Error> {
     let raw_hex = raw.strip_prefix("0x").unwrap_or(raw);
     let bytes = hex::decode(raw_hex)
@@ -317,7 +426,12 @@ fn fold_zswap_event(
         .map_err(|e| std::io::Error::other(format!("decode zswap event: {e}")))?;
     *wallet = crypto_provider
         .fold_shielded(wallet.clone(), &ev)
-        .map_err(|e| std::io::Error::other(format!("replay zswap event into wallet: {e}")))?;
+        .map_err(|e| {
+            crate::tip_verify::fold_failure(
+                from_snapshot,
+                std::io::Error::other(format!("replay zswap event into wallet: {e}")),
+            )
+        })?;
     Ok(())
 }
 
@@ -426,7 +540,12 @@ indexer may be stalled",
                 // the indexer re-sends the event at the cursor. It is already in the wallet, and
                 // `replay_events` rejects re-inserting a committed output, so fold only past it.
                 if evt.id > state.last_seen_id {
-                    fold_zswap_event(crypto_provider, &mut state.wallet, &evt.raw)?;
+                    fold_zswap_event(
+                        crypto_provider,
+                        &mut state.wallet,
+                        &evt.raw,
+                        state.from_snapshot,
+                    )?;
                     state.last_seen_id = evt.id;
                 }
 
@@ -571,6 +690,60 @@ mod tests {
         let state = state.expect("a replay advancing on every connection must finish");
         assert_eq!(state.last_seen_id, 19);
         assert_eq!(state.wallet.first_free, 20);
+    }
+
+    /// A snapshot the live stream does not fit — here a reset chain the genesis check could not
+    /// catch, because the genesis query failed — makes the resumed fold fail. The snapshot is then
+    /// discarded and the wallet replayed from genesis, rather than failing every run until the
+    /// cache is deleted by hand.
+    #[tokio::test]
+    async fn a_snapshot_the_live_events_do_not_fit_is_replayed_from_genesis() {
+        // The reset chain: its first output sits at event id 4, so ids no longer match tree indexes.
+        let url = mock_indexer::spawn(
+            "zswapLedgerEvents",
+            (4..9)
+                .map(|id| foreign_output_at(id, id as u64 - 4))
+                .collect(),
+            None,
+        )
+        .await;
+        let vault =
+            std::env::temp_dir().join(format!("ows-midnight-zswap-stale-{}", std::process::id()));
+        let scope = SyncCacheScope::for_wallet("w", Some(&vault));
+
+        // The old chain's snapshot: six outputs folded, cursor at event 5, no genesis hash.
+        let provider = provider();
+        let mut wallet = ZswapLocalState::new();
+        for e in (0..6).map(foreign_output) {
+            fold_zswap_event(&provider, &mut wallet, &e.raw, false).expect("fold");
+        }
+        let fp = cache_io::sync_site_fingerprint(&url, &scope);
+        let path = sync_cache::snapshot_path(&url, "fp", &scope).expect("cache path");
+        let cache = ZswapCache {
+            path: &path,
+            scope: &scope,
+            fp: &fp,
+            key_fp: "fp",
+            block_height: 0,
+            genesis_hash: "",
+        };
+        let stale = ZswapReplayState {
+            wallet,
+            from_snapshot: false,
+            last_seen_id: 5,
+            max_id: Some(5),
+            n_events: 0,
+            last_event_at: None,
+        };
+        save_zswap_snapshot(Some(&cache), &stale);
+
+        let state = run_zswap_replay(&url, &provider, &scope, "fp", None).await;
+        let _ = std::fs::remove_dir_all(&vault);
+
+        let state = state.expect("a stale snapshot must fall back to a genesis replay");
+        assert!(!state.from_snapshot);
+        assert_eq!(state.last_seen_id, 8);
+        assert_eq!(state.wallet.first_free, 5);
     }
 
     #[test]
