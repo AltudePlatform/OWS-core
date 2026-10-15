@@ -152,8 +152,15 @@ renamed into place, so an interrupted run never leaves a truncated one behind.
 
 ## Configuration
 
-The GraphQL indexer URL comes from `~/.ows/config.json` under `rpc["midnight:<network>"]` (the
-WebSocket URL is derived from it); defaults ship for mainnet/preview/preprod. Sync timeouts
+The GraphQL indexer URL comes from `~/.ows/config.json` under `rpc["midnight:<network>"]`; the
+WebSocket endpoint is that URL's path plus `/ws`, with any query kept. Only preview ships a
+default, since it is the only network with a public indexer that needs no API key. For mainnet
+and preprod, set the URL yourself: Midnight's
+[networks guide](https://docs.midnight.network/guides/networks-and-environments) lists the hosted
+endpoints, which take a per-network API key in a `?project_id=` query, or point it at your own
+indexer (for example `http://localhost:8088/api/v4/graphql`). Credentials in the URL (user info,
+query) never appear in error messages and are left out of the snapshot cache key, so rotating a
+key keeps the snapshots, while switching to another indexer starts a fresh sync. Sync timeouts
 (HTTP 30s, WS connect 30s, WS idle 90s, stall 120s) are fixed, not environment-configurable.
 
 ## Environment variables

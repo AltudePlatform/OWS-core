@@ -20,7 +20,9 @@ pub fn resolve_indexer_url(chain_id: &str) -> Result<String, std::io::Error> {
         .map(str::to_string)
         .ok_or_else(|| {
             invalid_input(format!(
-                "no Midnight indexer URL configured for {chain_id} (set `rpc.{chain_id}` in config)"
+                "no Midnight indexer URL configured for {chain_id}: set `rpc.{chain_id}` in config \
+to an indexer's GraphQL URL (Midnight lists the endpoints for each network at \
+https://docs.midnight.network/guides/networks-and-environments)"
             ))
         })
 }

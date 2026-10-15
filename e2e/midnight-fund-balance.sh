@@ -12,14 +12,17 @@
 # (give a new name + the words). It also serves as a live check of the runtime dust gating: on a
 # network whose dust ledger is active (Preview/Preprod), the "Dust status" section must appear.
 #
-# Usage:  ./midnight-fund-balance.sh [network]   # network defaults to midnight:preprod
-# Env:    CHAIN=midnight:preview   PROFILE=debug (faster build, slower sync)   FRESH=1 (no cache)
+# Usage:  ./midnight-fund-balance.sh [network]   # network defaults to midnight:preview
+# Env:    CHAIN=midnight:preprod   PROFILE=debug (faster build, slower sync)   FRESH=1 (no cache)
+#
+# Only preview ships a default indexer. For mainnet/preprod, first set `rpc."midnight:<network>"`
+# in ~/.ows/config.json (see docs/midnight/fund-balance.md, "Configuration").
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE="$SCRIPT_DIR/../ows"
-CHAIN="${1:-${CHAIN:-midnight:preprod}}"
+CHAIN="${1:-${CHAIN:-midnight:preview}}"
 
 # Colours — bold-blue headings, cyan commands, dim asides, green/red pass-fail. Suppressed when
 # stdout is not a terminal, so a piped/headless run stays free of escape codes.
@@ -75,6 +78,16 @@ else
 fi
 [ -x "$OWS" ] || { printf '%s✗ build did not produce %s%s\n' "$RED" "$OWS" "$RESET"; exit 1; }
 
+# Fail early when the network has no indexer (only preview ships one). Checked quietly: the URL
+# can carry an API key. Not `grep -q`: it stops reading at the match, `ows` then fails writing
+# the rest, and pipefail reports the pipeline as failed.
+if ! "$OWS" config show 2>/dev/null | grep "^  $CHAIN " >/dev/null; then
+  printf '%s✗ no indexer configured for %s: set rpc."%s" in ~/.ows/config.json%s\n' \
+    "$RED" "$CHAIN" "$CHAIN" "$RESET"
+  note "  (docs/midnight/fund-balance.md, \"Configuration\", lists where to get one)"
+  exit 1
+fi
+
 # ── Collect inputs ──────────────────────────────────────────────────────────────────────
 echo
 say "Wallets currently in your vault:"
@@ -112,7 +125,10 @@ KEYNAME="${WALLET}-smoke-key"
 [ "${FRESH:-0}" = "1" ] && export OWS_MIDNIGHT_SYNC_CACHE=0
 
 # ── 2. Sanity: config (vault path + indexer endpoints) ──────────────────────────────────
-run "config: vault path + indexer endpoints" "ows config show" "$OWS" config show
+# `ows config show` prints URLs verbatim, and an indexer URL can carry an API key in its query.
+config_show_redacted() { "$OWS" config show | sed -E 's/\?[^[:space:]]*/?<redacted>/'; }
+run "config: vault path + indexer endpoints (URL queries redacted)" "ows config show" \
+  config_show_redacted
 
 # ── 3. Import the wallet (only when it doesn't already exist) ────────────────────────────
 if [ "$WALLET_EXISTS" -eq 0 ]; then

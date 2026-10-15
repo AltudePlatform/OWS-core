@@ -28,9 +28,13 @@ pub use ows_core::sync_cache::{
     snapshot_chain_id, snapshot_chain_matches, try_load_versioned, try_save, SyncCacheScope,
 };
 
-/// Normalize an indexer URL (trim trailing slash, lowercase) for stable hashing.
+/// Normalize an indexer URL (drop credentials, trim trailing slash, lowercase) for stable hashing.
+/// An API key in the URL is left out, so rotating it keeps the snapshots.
 pub fn normalize_indexer_base(indexer_url: &str) -> String {
-    indexer_url.trim_end_matches('/').to_lowercase()
+    crate::urls::without_credentials(indexer_url)
+        .unwrap_or_else(|| indexer_url.to_string())
+        .trim_end_matches('/')
+        .to_lowercase()
 }
 
 /// Fingerprint for `(indexer_url, chain_id)` used to key a snapshot's sync site.
@@ -139,5 +143,21 @@ mod tests {
             &SyncCacheScope::default(),
         );
         assert_ne!(fp, fp_default);
+    }
+
+    #[test]
+    fn an_api_key_in_the_url_does_not_change_the_snapshot() {
+        let scope =
+            SyncCacheScope::for_wallet("wallet-abc", None).with_chain_id("midnight:preprod");
+        let plain = "https://indexer.example/api/v0";
+        let keyed = "https://indexer.example/api/v0?project_id=KEY";
+        assert_eq!(
+            sync_site_fingerprint(plain, &scope),
+            sync_site_fingerprint(keyed, &scope)
+        );
+        assert_eq!(
+            snapshot_path("dust", plain, "pk", &scope),
+            snapshot_path("dust", keyed, "pk", &scope)
+        );
     }
 }

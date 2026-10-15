@@ -101,13 +101,12 @@ pub async fn fetch_indexer_tip_with_client(
         }))
         .send()
         .await
-        .map_err(|e| std::io::Error::other(format!("indexer query failed: {e}")))?;
+        .map_err(|e| std::io::Error::other(format!("indexer query failed: {}", e.without_url())))?;
 
     let status = resp.status();
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| std::io::Error::other(format!("indexer read body failed: {e}")))?;
+    let body = resp.text().await.map_err(|e| {
+        std::io::Error::other(format!("indexer read body failed: {}", e.without_url()))
+    })?;
     if !status.is_success() {
         return Err(std::io::Error::other(format!(
             "indexer returned {status}: {body}"
@@ -157,13 +156,12 @@ pub async fn fetch_indexer_block_height_with_client(
         }))
         .send()
         .await
-        .map_err(|e| std::io::Error::other(format!("indexer query failed: {e}")))?;
+        .map_err(|e| std::io::Error::other(format!("indexer query failed: {}", e.without_url())))?;
 
     let status = resp.status();
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| std::io::Error::other(format!("indexer read body failed: {e}")))?;
+    let body = resp.text().await.map_err(|e| {
+        std::io::Error::other(format!("indexer read body failed: {}", e.without_url()))
+    })?;
     if !status.is_success() {
         return Err(std::io::Error::other(format!(
             "indexer returned {status}: {body}"
@@ -196,13 +194,12 @@ pub async fn fetch_indexer_genesis_hash(indexer_url: &str) -> Result<String, std
         }))
         .send()
         .await
-        .map_err(|e| std::io::Error::other(format!("indexer query failed: {e}")))?;
+        .map_err(|e| std::io::Error::other(format!("indexer query failed: {}", e.without_url())))?;
 
     let status = resp.status();
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| std::io::Error::other(format!("indexer read body failed: {e}")))?;
+    let body = resp.text().await.map_err(|e| {
+        std::io::Error::other(format!("indexer read body failed: {}", e.without_url()))
+    })?;
     if !status.is_success() {
         return Err(std::io::Error::other(format!(
             "indexer returned {status}: {body}"
@@ -228,4 +225,25 @@ pub async fn fetch_indexer_ledger_parameters(
     indexer_url: &str,
 ) -> Result<midnight_ledger::structure::LedgerParameters, std::io::Error> {
     Ok(fetch_indexer_tip(indexer_url).await?.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_failed_request_does_not_echo_the_url() {
+        // A port that was just released refuses the connection.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("bind")
+            .port();
+        let url = format!("http://127.0.0.1:{port}/api/v4/graphql?project_id=SECRET");
+        let err = fetch_indexer_block_height(&url)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("indexer query failed"), "{err}");
+        assert!(!err.contains("SECRET"), "{err}");
+    }
 }
