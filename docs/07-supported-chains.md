@@ -87,16 +87,6 @@ Each network has a canonical chain identifier. Endpoint discovery and transport 
 | Midnight Preview | `midnight:preview` |
 | Midnight Preprod | `midnight:preprod` |
 
-Midnight is not limited to these three networks: **any `midnight:<network>` chain id is addressable**, so ad-hoc feature testnets and private deployments work without registering anything. The `<network>` reference is carried verbatim into the Bech32m HRP of every Midnight address — mainnet uses the bare HRP (`mn_addr`, `mn_shield-addr`, `mn_dust`) while every other network appends `_<network>` (`mn_addr_preview`, `mn_addr_my-feature`, …), so an address on one network can never be mistaken for one on another. The reference MUST be a valid Bech32m HRP fragment that the Midnight SDK also accepts: lowercase letters, digits 1-9, and hyphens only (no `0`), not starting or ending with a hyphen, and at most 32 characters (the CAIP-2 reference limit). A malformed or mixed-case reference is rejected — never coerced to lowercase and never cast to mainnet.
-
-### Midnight indexer sync (OWS)
-
-`ows fund balance --chain midnight:*` replays indexer state (unshielded UTXOs, shielded balances, and the DUST fee ledger on any network whose dust ledger is live — detected at run time by probing the indexer, so mainnet lights up automatically once its dust ledger is active). OWS caches snapshots under `{vault}/chains/midnight/cache/{unshielded|shielded|dust}/{wallet_id}/` per network (`chain_id` in the cache key), when a wallet id is known.
-
-Configure the GraphQL indexer in `~/.ows/config.json` (`rpc["midnight:<network>"]`); the WebSocket URL is derived from it. Only preview ships a default: mainnet and preprod have no public indexer that works without an API key, so set their URL from Midnight's [networks guide](https://docs.midnight.network/guides/networks-and-environments) (the API key goes in the URL's query) or point it at your own indexer. The relevant environment variable (`OWS_MIDNIGHT_SYNC_CACHE`) and the full output are documented in [`midnight/fund-balance.md`](./midnight/fund-balance.md); the disk-cache layout lives on [`cache_io`](../../ows/crates/ows-midnight/src/cache_io.rs) in `ows-midnight`.
-
-Universal wallets store one Midnight account (`midnight:mainnet`, mainnet Bech32m HRP). Preview, Preprod, and future networks use the same unshielded key; network-specific addresses are derived at operation time (different Bech32m HRP), matching how XRPL testnet shares a key with mainnet. **Imported private-key wallets** have no Midnight account: Midnight's three role keys are derived from a mnemonic, so Midnight needs a mnemonic wallet.
-
 Implementations MAY ship convenience endpoint defaults, but those defaults are deployment choices rather than OWS interoperability requirements.
 
 ## Shorthand Aliases

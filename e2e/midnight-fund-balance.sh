@@ -16,7 +16,7 @@
 # Env:    CHAIN=midnight:preprod   PROFILE=debug (faster build, slower sync)   FRESH=1 (no cache)
 #
 # Only preview ships a default indexer. For mainnet/preprod, first set `rpc."midnight:<network>"`
-# in ~/.ows/config.json (see docs/midnight/fund-balance.md, "Configuration").
+# in ~/.ows/config.json (see docs/midnight.md, "Fund balance" > "Configuration").
 
 set -uo pipefail
 
@@ -84,7 +84,7 @@ fi
 if ! "$OWS" config show 2>/dev/null | grep "^  $CHAIN " >/dev/null; then
   printf '%s✗ no indexer configured for %s: set rpc."%s" in ~/.ows/config.json%s\n' \
     "$RED" "$CHAIN" "$CHAIN" "$RESET"
-  note "  (docs/midnight/fund-balance.md, \"Configuration\", lists where to get one)"
+  note "  (docs/midnight.md, \"Fund balance\" > \"Configuration\", lists where to get one)"
   exit 1
 fi
 
