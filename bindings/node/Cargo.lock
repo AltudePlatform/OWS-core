@@ -2663,6 +2663,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "uuid",
 ]
@@ -2725,6 +2726,7 @@ dependencies = [
  "libc",
  "midnight-ledger",
  "midnight-serialize",
+ "midnight-storage",
  "midnight-zswap",
  "num-bigint",
  "ows-core",
